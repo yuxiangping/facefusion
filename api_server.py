@@ -1,23 +1,24 @@
 import sys
 import os
 import argparse
+import time
 import uvicorn
 import shutil
 import cv2
 import numpy as np
-import subprocess
 import base64
 import requests
-import time
 import traceback
 import logging
 import uuid
 import signal
-import importlib
 import asyncio
+import subprocess
+import urllib3
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import List, Any, Optional, Tuple, Dict
+from typing import List, Any, Optional, Tuple
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -30,35 +31,33 @@ current_dir = os.path.dirname(current_file_path)
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
+# 优化线程池配置
+TASK_EXECUTOR = ThreadPoolExecutor(max_workers=16)
+BATCH_EXECUTOR = ThreadPoolExecutor(max_workers=8)
+
+# 批处理配置
+BATCH_SIZE = 10  # 批次大小
+FRAME_BUFFER_SIZE = 16  # 内存占用
+MAX_CONCURRENT_BATCHES = 4  # 并发
+
 # ================= FaceFusion 依赖 =================
 
-import facefusion
 from facefusion import state_manager, face_analyser, content_analyser, inference_manager
 from facefusion.vision import read_static_image, write_image, read_image
 from facefusion.face_detector import detect_faces
-from facefusion.face_landmarker import detect_face_landmark
+from facefusion.face_analyser import scale_face
 
-# Face Swapper and Enhancer modules - simplified imports
+# Face Swapper and Enhancer modules
 try:
-    # Try to import the core modules using correct paths
-    from facefusion.face_swapper import swap_face as face_swapper_core, get_model_options as face_swapper_options
-    from facefusion.face_enhancer import enhance_face as face_enhancer_core, get_model_options as face_enhancer_options
+    from facefusion.processors.modules.face_swapper.core import swap_face as face_swapper_core, get_model_options as face_swapper_options
+    from facefusion.processors.modules.face_enhancer.core import enhance_face as face_enhancer_core, get_model_options as face_enhancer_options
     FACE_ENHANCER_AVAILABLE = True
     FACE_SWAPPER_AVAILABLE = True
-    print("DEBUG: Successfully imported face processing modules from facefusion.*")
-except ImportError as e:
-    print(f"WARNING: Could not import advanced face processing modules: {e}")
-    # Try alternative imports
-    try:
-        from facefusion.processors.modules.face_swapper.core import swap_face as face_swapper_core, get_model_options as face_swapper_options
-        from facefusion.processors.modules.face_enhancer.core import enhance_face as face_enhancer_core, get_model_options as face_enhancer_options
-        FACE_ENHANCER_AVAILABLE = True
-        FACE_SWAPPER_AVAILABLE = True
-        print("DEBUG: Imported face processing modules from processors path")
-    except ImportError as e2:
-        print(f"WARNING: Alternative import also failed: {e2}")
-        FACE_ENHANCER_AVAILABLE = False
-        FACE_SWAPPER_AVAILABLE = False
+    print("DEBUG: Imported face processing modules from processors path")
+except ImportError as e2:
+    print(f"WARNING: Alternative import also failed: {e2}")
+    FACE_ENHANCER_AVAILABLE = False
+    FACE_SWAPPER_AVAILABLE = False
 
 # ================= Monkey Patch =================
 
@@ -109,10 +108,21 @@ def apply_patches():
 
     print(">>> Monkey Patches Applied (Safe Detect & NSFW Bypass)")
 
-# ================= 日志配置 =================
+# ================= 线程配置 =================
 
 ARGS = None
 TASK_STATUS = {}  # In-memory task status store
+TASK_STATUS_LOCK = threading.Lock()  # 线程安全保护
+
+def update_task_status(task_id: str, status_info: dict):
+    """线程安全的任务状态更新"""
+    with TASK_STATUS_LOCK:
+        TASK_STATUS[task_id] = status_info
+
+def get_task_status(task_id: str) -> Optional[dict]:
+    """线程安全的任务状态获取"""
+    with TASK_STATUS_LOCK:
+        return TASK_STATUS.get(task_id)
 
 class StreamToLogger(object):
     def __init__(self, logger, level):
@@ -130,6 +140,8 @@ class StreamToLogger(object):
                 self.logger.log(self.level, line)
     def flush(self): pass
     def isatty(self): return False
+
+# ================= 日志配置 =================
 
 def setup_logging(log_file_path: str):
     """Setup proper logging configuration"""
@@ -164,29 +176,55 @@ def setup_logging(log_file_path: str):
     sys.stdout = StreamToLogger(logging.getLogger('STDOUT'), logging.INFO)
     sys.stderr = StreamToLogger(logging.getLogger('STDERR'), logging.ERROR)
 
+class UvicornAccessFilter(logging.Filter):
+    """过滤器：过滤/api/status/{task_id}路径的访问日志"""
+    def filter(self, record):
+        return "GET /api/status/" not in record.getMessage()
+
+# ================= GPU内存管理优化 =================
+
+def optimize_gpu_memory():
+    """优化GPU内存配置"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            # 启用内存映射
+            torch.cuda.set_per_process_memory_fraction(0.45)  # 使用45%的GPU内存
+            # 启用缓存分配器
+            torch.cuda.empty_cache()
+            # 设置内存增长策略
+            torch.multiprocessing.set_sharing_strategy('file_system')
+            print(f"DEBUG: GPU Memory Optimized - Available: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+    except ImportError:
+        print("WARNING: PyTorch not available for GPU memory optimization")
+    except Exception as e:
+        print(f"WARNING: GPU memory optimization failed: {e}")
+
 # ================= Lifespan Management =================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
-    print(">>> Initializing FaceFusion 3.5 Master Models...")
+    print(">>> Initializing FaceFusion 3.5 Master Models with Optimizations...")
     try:
         apply_patches()
+        optimize_gpu_memory()
 
-        # Initialize state with proper settings (CLI compatible)
+        # Initialize state with proper settings (CLI compatible) - 优化配置
         state_manager.init_item('execution_providers', ['cuda'])
         state_manager.init_item('execution_device_ids', [0])  # GPU 0
-        state_manager.init_item('execution_thread_count', 18)
-        state_manager.init_item('execution_queue_count', 1)
+        state_manager.init_item('execution_thread_count', 16)
+        state_manager.init_item('execution_queue_count', 2)
         state_manager.init_item('download_providers', ['github', 'huggingface'])
         state_manager.init_item('download_scope', 'full')
+
+        # 内存优化配置
+        state_manager.init_item('video_memory_strategy', 'moderate')  # 保守内存策略
+        state_manager.init_item('temp_frame_format', 'jpg')           # JPG格式节省内存
 
         # Initialize additional CLI-compatible states
         state_manager.init_item('command', 'run')  # Simulate CLI mode
         state_manager.init_item('ui_layouts', ['default'])  # Use default layout
-
-        # API server runs in CLI context automatically via detect_app_context()
-        import facefusion
 
         # Face detector settings
         state_manager.init_item('face_detector_model', 'yolo_face')
@@ -203,23 +241,28 @@ async def lifespan(app: FastAPI):
         state_manager.init_item('face_selector_mode', 'reference')
         state_manager.init_item('face_selector_order', 'large-small')
         state_manager.init_item('face_selector_gender', 'none')
-        state_manager.init_item('face_selector_age_start', None)
-        state_manager.init_item('face_selector_age_end', None)
-        state_manager.init_item('reference_face_distance', 0.6)
+        state_manager.init_item('face_selector_race', 'none')
+        state_manager.init_item('face_selector_age_start', 0)
+        state_manager.init_item('face_selector_age_end', 100)
+        state_manager.init_item('reference_face_distance', 0.3)
 
         # Face enhancer settings
-        state_manager.init_item('face_enhancer_model', 'gfpgan_1.4')
+        state_manager.init_item('face_enhancer_model', 'gpen_bfr_512')
         state_manager.init_item('face_enhancer_blend', 80)
         state_manager.init_item('face_enhancer_weight', 1.0)
 
         # Face swapper settings
         state_manager.init_item('face_swapper_model', 'inswapper_128_fp16')
         state_manager.init_item('face_swapper_pixel_boost', '128x128')
+        state_manager.init_item('face_swapper_weight', '0.5')
+
+        # CRITICAL: Initialize processors configuration (required for换脸和增强功能)
+        state_manager.init_item('processors', ['face_swapper', 'face_enhancer'])
 
         # Face mask settings (required for face swapping)
         state_manager.init_item('face_mask_types', ['box'])
         state_manager.init_item('face_mask_blur', 0.5)  # Higher blur for smoother edges
-        state_manager.init_item('face_mask_padding', [5, 5, 5, 5])  # Small padding to avoid hard edges
+        state_manager.init_item('face_mask_padding', [0, 0, 0, 0])  # Small padding to avoid hard edges
         state_manager.init_item('face_mask_areas', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
         # Output settings
@@ -227,10 +270,6 @@ async def lifespan(app: FastAPI):
         state_manager.init_item('output_video_encoder', 'h264_nvenc')
         state_manager.init_item('output_video_quality', 80)
         state_manager.init_item('output_audio_encoder', 'aac')
-
-        # Video processing settings
-        state_manager.init_item('video_memory_strategy', 'tolerant')
-        state_manager.init_item('temp_frame_format', 'jpeg')
 
         print(">>> Warming up models...")
         # Create dummy frame for model initialization
@@ -320,6 +359,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan, title="FaceFusion API", version="3.5")
 
+# 日志过滤器
+uvicorn_access_logger = logging.getLogger("uvicorn.access")
+uvicorn_access_logger.addFilter(UvicornAccessFilter())
+
 # ================= 工具函数 =================
 
 def get_temp_file_path(filename: str) -> str:
@@ -347,7 +390,6 @@ def download_file(url: str, save_path: str, timeout: int = 60):
         }
 
         # 禁用SSL验证警告
-        import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
         with requests.get(url, stream=True, timeout=timeout, headers=headers, verify=False) as r:
@@ -451,7 +493,9 @@ def calc_process_params(cap: cv2.VideoCapture, req_fps: Optional[float], req_min
     final_fps = src_fps
     if req_fps is not None and req_fps > 0:
         if req_fps < src_fps:
-            final_fps = req_fps
+            final_fps = max(req_fps, src_fps)
+    
+    final_fps = max(1.0, final_fps)  # 最小1fps
 
     # Calculate final resolution
     final_res = (src_w, src_h)
@@ -503,159 +547,322 @@ def get_one_face_from_frame(frame):
         return None
     return face_analyser.get_one_face(faces, 0)
 
+# ================= 批处理 =================
+
+def process_frame_batch_optimized(frames_batch: List[np.ndarray], loaded_pairs: List[dict], mode: str) -> List[np.ndarray]:
+    """批量处理 - 减少开销和优化流程"""
+    if not frames_batch:
+        return []
+
+    start_time = time.time()
+    processed_frames = []
+
+    # 批量预处理 - 减少重复操作
+    preprocessed_frames = []
+    for frame in frames_batch:
+        # 统一格式转换，减少重复调用
+        if frame.dtype != np.uint8:
+            if frame.max() <= 1.0:  # 归一化的浮点图像 [0,1]
+                frame = (frame * 255).clip(0, 255).astype(np.uint8)
+            else:  # 其他范围的浮点图像
+                frame = frame.clip(0, 255).astype(np.uint8)
+        preprocessed_frames.append(frame)
+
+    # 批量人脸检测（优化：连续调用减少模型切换）
+    for i, frame in enumerate(preprocessed_frames):
+        # 直接处理，减少函数调用开销
+        try:
+            faces = face_analyser.get_many_faces([frame])
+
+            if faces:
+                # 内联处理，避免额外函数调用
+                frame = force_bgr(frame)
+                original_dtype = frame.dtype
+
+                # 人脸交换 - 对每个检测到的人脸进行处理
+                for face_idx, face in enumerate(faces):
+                    target_src = None
+                    if mode == "single":
+                        target_src = loaded_pairs[0]["source_face"]
+                    else:
+                        # 多人脸匹配逻辑（简化版）
+                        best_similarity = -1
+                        best_pair_idx = 0
+                        for j, p in enumerate(loaded_pairs):
+                            if p["ref_embedding"] is not None and hasattr(face, 'embedding'):
+                                similarity = np.dot(face.embedding, p["ref_embedding"])
+                                if similarity > 0.4 and similarity > best_similarity:
+                                    best_similarity = similarity
+                                    best_pair_idx = j
+                        target_src = loaded_pairs[best_pair_idx]["source_face"]
+
+                    # 直接进行换脸，减少函数调用
+                    if target_src and FACE_SWAPPER_AVAILABLE and face_swapper_core is not None:
+                        try:
+                            has_face_landmarks = (hasattr(face, 'landmark_set') and face.landmark_set)
+                            has_src_landmarks = (hasattr(target_src, 'landmark_set') and target_src.landmark_set)
+
+                            if has_face_landmarks and has_src_landmarks:
+                                scaled_face = scale_face(face, frame, frame)
+                                swapped_frame = face_swapper_core(
+                                    source_face=target_src,
+                                    target_face=scaled_face,
+                                    temp_vision_frame=frame
+                                )
+                                if swapped_frame is not None and not np.any(np.isnan(swapped_frame)):
+                                    frame = swapped_frame  # 更新当前帧
+                        except Exception as e:
+                            print(f"WARNING: Face {face_idx} swap failed: {e}")
+
+                # 人脸增强 - 对所有人脸进行增强
+                if FACE_ENHANCER_AVAILABLE and face_enhancer_core is not None:
+                    for face in faces:
+                        try:
+                            has_face_landmarks = (hasattr(face, 'landmark_set') and face.landmark_set)
+                            if has_face_landmarks:
+                                scaled_face = scale_face(face, frame, frame)
+                                enhanced_frame = face_enhancer_core(
+                                    target_face=scaled_face,
+                                    temp_vision_frame=frame
+                                )
+                                if enhanced_frame is not None and not np.any(np.isnan(enhanced_frame)):
+                                    frame = enhanced_frame
+                                    break  # 成功增强后停止
+                        except Exception as e:
+                            print(f"WARNING: Face enhancement failed: {e}")
+
+                # 最终验证（简化版）
+                if frame is not None and frame.size > 0:
+                    frame = np.nan_to_num(frame, nan=0, posinf=255, neginf=0)
+                    if frame.dtype != original_dtype:
+                        frame = frame.astype(original_dtype)
+                    processed_frames.append(frame)
+                else:
+                    processed_frames.append(preprocessed_frames[i])
+            else:
+                processed_frames.append(preprocessed_frames[i])
+
+        except Exception as e:
+            # 错误处理：返回原始帧
+            processed_frames.append(preprocessed_frames[i])
+
+    batch_time = time.time() - start_time
+    fps = len(frames_batch) / batch_time if batch_time > 0 else 0
+    if batch_time > 0.5:  # 只记录耗时较长的批次
+        print(f"DEBUG: Optimized batch processed {len(frames_batch)} frames in {batch_time:.3f}s ({fps:.1f} FPS)")
+
+    return processed_frames
+
+def process_frame_batch(frames_batch: List[np.ndarray], loaded_pairs: List[dict], mode: str) -> List[np.ndarray]:
+    """兼容性包装器 - 保持原有接口"""
+    return process_frame_batch_optimized(frames_batch, loaded_pairs, mode)
+
+def process_video_optimized_sync(task_id: str, cap: cv2.VideoCapture, output_path: str,
+                                 loaded_pairs: List[dict], params: dict, final_res: tuple,
+                                 final_fps: float, media_type: str) -> str:
+    """同步优化处理 - 避免异步开销"""
+
+    # 创建临时输出视频
+    temp_out = get_temp_file_path(f"{task_id}_optimized.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(temp_out, fourcc, final_fps, final_res)
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    processed_count = 0
+    batch_count = 0
+
+    try:
+        while True:
+            # 批量加载帧
+            batch_frames = []
+            for _ in range(BATCH_SIZE):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                # 快速调整分辨率
+                if (frame.shape[1], frame.shape[0]) != final_res:
+                    frame = cv2.resize(frame, final_res, interpolation=cv2.INTER_AREA)
+
+                # 快速格式转换
+                if frame.dtype != np.uint8:
+                    frame = frame.astype(np.uint8)
+
+                batch_frames.append(frame)
+
+            if not batch_frames:
+                break
+
+            batch_count += 1
+            if batch_count % 10 == 0:  # 减少日志频率
+                print(f"[{task_id}] Processing batch {batch_count}, frames: {len(batch_frames)}")
+
+            # 直接处理，避免异步开销
+            processed_frames = process_frame_batch_optimized(batch_frames, loaded_pairs, params["mode"])
+
+            # 快速写入
+            for frame in processed_frames:
+                out.write(frame)
+                processed_count += 1
+
+            # 简化进度更新
+            if total_frames > 0 and batch_count % 10 == 0:
+                progress = min(80, 40 + int((processed_count / total_frames) * 40))
+                update_task_status(task_id, {
+                    "status": "processing",
+                    "message": f"Processing {processed_count}/{total_frames} frames",
+                    "progress": progress
+                })
+
+    finally:
+        if 'cap' in locals() and cap is not None:
+            cap.release()
+        if 'out' in locals() and out is not None:
+            out.release()
+
+    print(f"[{task_id}] Optimized processing completed: {processed_count} frames in {batch_count} batches")
+    return temp_out
+
+async def process_video_with_batches(task_id: str, cap: cv2.VideoCapture, output_path: str,
+                                    loaded_pairs: List[dict], params: dict, final_res: tuple,
+                                    final_fps: float, media_type: str):
+    """使用批处理优化视频处理"""
+
+    # 对于性能关键场景，使用同步处理避免异步开销
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        BATCH_EXECUTOR,
+        process_video_optimized_sync,
+        task_id, cap, output_path, loaded_pairs, params, final_res, final_fps, media_type
+    )
+
 # ================= 核心处理逻辑 =================
 
 async def process_swap_task_async(task_id: str, params: dict):
     """Async wrapper for swap task processing"""
-    loop = asyncio.get_event_loop()
-    with ThreadPoolExecutor() as executor:
-        await loop.run_in_executor(executor, process_swap_task, task_id, params)
+    await process_swap_task(task_id, params)
 
 def process_frame_core(frame: np.ndarray, faces: List, loaded_pairs: List[dict], mode: str) -> np.ndarray:
-    """Process frame with face swapping and enhancement"""
+    """Process frame with face swapping and enhancement using proper processor workflow"""
     if not faces:
         return frame
-
-    print(f"DEBUG: Input frame - shape: {frame.shape}, dtype: {frame.dtype}, min: {frame.min()}, max: {frame.max()}")
-    print(f"DEBUG: Found {len(faces)} faces to process")
 
     # Ensure frame has correct format and dtype
     frame = force_bgr(frame)
     original_dtype = frame.dtype
-
-    print(f"DEBUG: After force_bgr - shape: {frame.shape}, dtype: {frame.dtype}, min: {frame.min()}, max: {frame.max()}")
-
-    # 1. Face Swapping
-    for i, face in enumerate(faces):
-        target_src = None
-        if mode == "single":
-            target_src = loaded_pairs[0]["source_face"]
-            print(f"DEBUG: Face {i} - Using single mode, source face available: {target_src is not None}")
-        else:
-            # Multi-face: find matching reference face
-            for p in loaded_pairs:
-                if p["ref_embedding"] is not None:
-                    similarity = np.dot(face.embedding, p["ref_embedding"])
-                    print(f"DEBUG: Face {i} - Similarity with reference: {similarity}")
-                    if similarity > 0.4:
-                        target_src = p["source_face"]
-                        break
-
-        if target_src and FACE_SWAPPER_AVAILABLE and face_swapper_core is not None:
-            try:
-                # Validate face landmarks before processing
-                has_face_landmarks = (hasattr(face, 'landmark_set') and face.landmark_set)
-                has_src_landmarks = (hasattr(target_src, 'landmark_set') and target_src.landmark_set)
-
-                print(f"DEBUG: Face {i} - Landmarks available - face: {has_face_landmarks}, src: {has_src_landmarks}")
-
-                if has_face_landmarks and has_src_landmarks:
-
-                    print(f"DEBUG: Face {i} - Starting face swap...")
-                    # Use the core swap function from face_swapper module
-                    # Correct parameters: source_face, target_face, temp_vision_frame
-                    swapped_frame = face_swapper_core(
-                        source_face=target_src,
-                        target_face=face,
-                        temp_vision_frame=frame
-                    )
-
-                    print(f"DEBUG: Face {i} - Swap result - shape: {swapped_frame.shape if swapped_frame is not None else None}, dtype: {swapped_frame.dtype if swapped_frame is not None else None}")
-
-                    # Validate result before using it
-                    if swapped_frame is not None and swapped_frame.size > 0:
-                        # Check for NaN or Inf values
-                        has_nan = np.any(np.isnan(swapped_frame))
-                        has_inf = np.any(np.isinf(swapped_frame))
-
-                        print(f"DEBUG: Face {i} - Validation - NaN: {has_nan}, Inf: {has_inf}, min: {swapped_frame.min()}, max: {swapped_frame.max()}")
-
-                        if not has_nan and not has_inf:
-                            frame = swapped_frame
-                            print(f"DEBUG: Face {i} - Swap successful, frame updated")
-                        else:
-                            print(f"WARNING: Face {i} - Invalid values detected in swapped frame, skipping")
-                    else:
-                        print(f"WARNING: Face {i} - Invalid swapped frame returned, skipping")
-
-                else:
-                    print(f"WARNING: Face {i} - Face landmarks not available for swapping")
-            except Exception as e:
-                print(f"WARNING: Face {i} - Face swap failed: {e}")
-                import traceback
-                traceback.print_exc()
-
-    # 2. Face Enhancement
-    if FACE_ENHANCER_AVAILABLE and face_enhancer_core is not None:
-        print(f"DEBUG: Starting face enhancement for {len(faces)} faces")
-        try:
-            for i, face in enumerate(faces):
-                try:
-                    # Validate face landmarks before enhancement
-                    has_face_landmarks = (hasattr(face, 'landmark_set') and face.landmark_set)
-
-                    print(f"DEBUG: Enhancement - Face {i} has landmarks: {has_face_landmarks}")
-
-                    if has_face_landmarks:
-                        print(f"DEBUG: Enhancement - Face {i} - Starting enhancement...")
-                        # Correct parameters: target_face, temp_vision_frame
-                        enhanced_frame = face_enhancer_core(
-                            target_face=face,
-                            temp_vision_frame=frame
-                        )
-
-                        print(f"DEBUG: Enhancement - Face {i} - Enhanced frame - shape: {enhanced_frame.shape if enhanced_frame is not None else None}")
-
-                        # Validate result before using it
-                        if enhanced_frame is not None and enhanced_frame.size > 0:
-                            # Check for NaN or Inf values
-                            has_nan = np.any(np.isnan(enhanced_frame))
-                            has_inf = np.any(np.isinf(enhanced_frame))
-
-                            print(f"DEBUG: Enhancement - Face {i} - Validation - NaN: {has_nan}, Inf: {has_inf}, min: {enhanced_frame.min()}, max: {enhanced_frame.max()}")
-
-                            if not has_nan and not has_inf:
-                                frame = enhanced_frame
-                                print(f"DEBUG: Enhancement - Face {i} - Enhancement successful")
-                            else:
-                                print(f"WARNING: Enhancement - Face {i} - Invalid values detected in enhanced frame, skipping")
-                        else:
-                            print(f"WARNING: Enhancement - Face {i} - Invalid enhanced frame returned, skipping")
-                    else:
-                        print(f"WARNING: Enhancement - Face {i} - Face landmarks not available for enhancement")
-                except Exception as e:
-                    print(f"WARNING: Enhancement - Face {i} - Face enhancement failed: {e}")
-                    import traceback
-                    traceback.print_exc()
-        except Exception as e:
-            print(f"WARNING: Face enhancement failed: {e}")
-            import traceback
-            traceback.print_exc()
-    else:
-        print("WARNING: face_enhancer_core function not available")
+    
+    frame = do_face_swapping(frame, faces, loaded_pairs, mode)
+    frame = do_face_enhancement(frame, faces)
 
     # Ensure output frame has correct dtype and no invalid values
     if frame is not None:
-        # Check for invalid values before fixing
-        has_nan = np.any(np.isnan(frame))
-        has_inf = np.any(np.isinf(frame))
-
-        print(f"DEBUG: Final frame before cleanup - shape: {frame.shape}, dtype: {frame.dtype}, min: {frame.min()}, max: {frame.max()}")
-        print(f"DEBUG: Final frame has NaN: {has_nan}, has Inf: {has_inf}")
-
+        
         # Fix any potential NaN or Inf values
         frame = np.nan_to_num(frame, nan=0, posinf=255, neginf=0)
 
         # Ensure correct data type
         if frame.dtype != original_dtype:
             print(f"DEBUG: Converting dtype from {frame.dtype} to {original_dtype}")
-            frame = frame.astype(original_dtype)
-
-        print(f"DEBUG: Final frame after cleanup - shape: {frame.shape}, dtype: {frame.dtype}, min: {frame.min()}, max: {frame.max()}")
+            frame = frame.astype(original_dtype)        
 
     return frame
 
-def process_swap_task(task_id: str, params: dict):
+# 未使用的函数已被移除 - do_single_face_swap 未被调用
+
+def do_face_swapping(frame: np.ndarray, faces: List, loaded_pairs: List[dict], mode: str) -> np.ndarray:
+    """Manual face swapping method"""
+
+    for i, face in enumerate(faces):
+        target_src = None
+        if mode == "single":
+            target_src = loaded_pairs[0]["source_face"]
+        else:
+            # FIXED: Multi-face: find best matching reference face
+            best_similarity = -1
+            best_pair_idx = -1
+
+            for j, p in enumerate(loaded_pairs):
+                if p["ref_embedding"] is not None and hasattr(face, 'embedding'):
+                    similarity = np.dot(face.embedding, p["ref_embedding"])
+
+                    # Use the highest similarity above threshold, not just the first match
+                    if similarity > 0.4 and similarity > best_similarity:
+                        best_similarity = similarity
+                        best_pair_idx = j                        
+
+            # Use the best match if found
+            if best_pair_idx >= 0:
+                target_src = loaded_pairs[best_pair_idx]["source_face"]                
+            else:
+                # If no good match found, use the first source as fallback
+                if loaded_pairs:
+                    target_src = loaded_pairs[0]["source_face"]
+                    print(f"DEBUG: Face {i} - No good match found, using first source as fallback")
+
+        if target_src and FACE_SWAPPER_AVAILABLE and face_swapper_core is not None:
+            try:
+                has_face_landmarks = (hasattr(face, 'landmark_set') and face.landmark_set)
+                has_src_landmarks = (hasattr(target_src, 'landmark_set') and target_src.landmark_set)
+
+                if has_face_landmarks and has_src_landmarks:
+                    # CRITICAL FIX: Apply scale_face to adjust face coordinates
+                    scaled_face = scale_face(face, frame, frame)
+
+                    swapped_frame = face_swapper_core(
+                        source_face=target_src,
+                        target_face=scaled_face,
+                        temp_vision_frame=frame
+                    )
+
+                    if swapped_frame is not None and swapped_frame.size > 0:
+                        has_nan = np.any(np.isnan(swapped_frame))
+                        has_inf = np.any(np.isinf(swapped_frame))
+
+                        if not has_nan and not has_inf:
+                            frame = swapped_frame
+                        else:
+                            print(f"WARNING: Face {i} - Swap returned invalid values")
+                    else:
+                        print(f"WARNING: Face {i} - Swap returned None or empty")
+                else:
+                    print(f"WARNING: Face {i} - Missing face landmarks")
+
+            except Exception as e:
+                print(f"WARNING: Face {i} - Swap failed: {e}")
+        else:
+            print(f"DEBUG: Face {i} - No source face available")
+
+    return frame
+
+def do_face_enhancement(frame: np.ndarray, faces: List) -> np.ndarray:
+    """Mmanual face enhancement method"""
+    if FACE_ENHANCER_AVAILABLE and face_enhancer_core is not None:        
+        try:
+            for i, face in enumerate(faces):
+                has_face_landmarks = (hasattr(face, 'landmark_set') and face.landmark_set)
+
+                if has_face_landmarks:
+                    # CRITICAL FIX: Apply scale_face to adjust face coordinates
+                    scaled_face = scale_face(face, frame, frame)
+
+                    enhanced_frame = face_enhancer_core(
+                        target_face=scaled_face,
+                        temp_vision_frame=frame
+                    )
+
+                    if enhanced_frame is not None and enhanced_frame.size > 0:
+                        has_nan = np.any(np.isnan(enhanced_frame))
+                        has_inf = np.any(np.isinf(enhanced_frame))
+
+                        if not has_nan and not has_inf:
+                            frame = enhanced_frame
+
+        except Exception as e:
+            print(f"WARNING: Face enhancement failed: {e}")
+
+    return frame
+
+async def process_swap_task(task_id: str, params: dict):
     """Main swap task processing function"""
     temp_files = []
     output_path = params["output_path"]
@@ -663,8 +870,9 @@ def process_swap_task(task_id: str, params: dict):
     # Update task status
     TASK_STATUS[task_id] = {"status": "processing", "message": "Starting task", "progress": 0}
 
-    try:
-        print(f"[{task_id}] Start. Mode: {params['mode']}")
+    start_time = time.time()
+    try:        
+        print(f"[{task_id}] Start. Mode: {params['mode']} - {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
         # Download target file
         target_url = params["target_url"]
@@ -739,6 +947,7 @@ def process_swap_task(task_id: str, params: dict):
 
                 loaded_pairs.append({
                     "source_face": s_face,
+                    "source_frame": s_frame,  # IMPORTANT: Save actual frame for processor workflow
                     "ref_embedding": ref_emb,
                     "source_url": src_url
                 })
@@ -787,113 +996,59 @@ def process_swap_task(task_id: str, params: dict):
             # Save result
             write_image(output_path, frame)
 
-        # Process Video/GIF
+        # Process Video/GIF with batch optimization
         else:
+            print(f"[{task_id}] Starting optimized batch video processing")
+
             cap = cv2.VideoCapture(target_local)
             final_fps, final_res = calc_process_params(
                 cap, params.get("fps"), params.get("min_resolution")
             )
 
             # Set default FPS
-            if media_type == 'gif' and (final_fps <= 0 or final_fps > 60):
-                final_fps = 15
-            if media_type == 'video' and (final_fps <= 0 or final_fps > 120):
-                final_fps = 30
+            if media_type == 'gif':
+                final_fps = min(final_fps, 20)
+            if media_type == 'video':
+                final_fps = min(final_fps, 60)
 
-            # Create temporary output video
-            temp_out = get_temp_file_path(f"{task_id}_proc.mp4")
-            temp_files.append(temp_out)
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(temp_out, fourcc, final_fps, final_res)
+            # Set default resolution
+            output_width = None
+            if media_type == 'gif':
+                max_width = 2560
+                max_height = 1440
+                fw, fh = final_res
 
-            frame_count = 0
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret: break
-
-                # Resize if needed
-                if (frame.shape[1], frame.shape[0]) != final_res:
-                    frame = cv2.resize(frame, final_res, interpolation=cv2.INTER_AREA)
-
-                # Convert to BGR
-                frame = force_bgr(frame)
-
-                # Process faces
-                faces = face_analyser.get_many_faces([frame])
-                print(f"DEBUG: Frame {frame_count} - Detected {len(faces)} faces")
-
-                if faces:
-                    original_frame = frame.copy()
-                    processed_frame = process_frame_core(frame, faces, loaded_pairs, params["mode"])
-
-                    # Check if processing actually changed the frame
-                    if processed_frame is not None:
-                        # Calculate difference between original and processed
-                        diff = np.abs(processed_frame.astype(np.float32) - original_frame.astype(np.float32))
-                        mean_diff = diff.mean()
-                        max_diff = diff.max()
-
-                        print(f"DEBUG: Frame {frame_count} - Frame difference - Mean: {mean_diff:.2f}, Max: {max_diff}")
-
-                        # Analyze pixel value distribution
-                        orig_mean = original_frame.mean()
-                        orig_std = original_frame.std()
-                        proc_mean = processed_frame.mean()
-                        proc_std = processed_frame.std()
-
-                        print(f"DEBUG: Frame {frame_count} - Original - Mean: {orig_mean:.2f}, Std: {orig_std:.2f}")
-                        print(f"DEBUG: Frame {frame_count} - Processed - Mean: {proc_mean:.2f}, Std: {proc_std:.2f}")
-
-                        # Check if processed frame is just black
-                        non_zero_ratio = np.count_nonzero(processed_frame) / processed_frame.size
-                        zero_ratio = np.count_nonzero(processed_frame == 0) / processed_frame.size
-                        high_ratio = np.count_nonzero(processed_frame > 240) / processed_frame.size
-
-                        print(f"DEBUG: Frame {frame_count} - Non-zero pixel ratio: {non_zero_ratio:.4f}")
-                        print(f"DEBUG: Frame {frame_count} - Zero pixel ratio: {zero_ratio:.4f}")
-                        print(f"DEBUG: Frame {frame_count} - High pixel (>240) ratio: {high_ratio:.4f}")
-
-                        # Check if face region looks valid
-                        if zero_ratio > 0.5:  # More than 50% black pixels
-                            print(f"WARNING: Frame {frame_count} - Processed frame is mostly black ({zero_ratio:.4f}% zero), using original")
-                            frame = original_frame
-                        elif high_ratio > 0.8:  # More than 80% bright pixels
-                            print(f"WARNING: Frame {frame_count} - Processed frame has too many bright pixels ({high_ratio:.4f}% >240), using original")
-                            frame = original_frame
-                        elif proc_std < 10:  # Very low variation (likely uniform color)
-                            print(f"WARNING: Frame {frame_count} - Processed frame has low variation (std: {proc_std:.2f}), using original")
-                            frame = original_frame
-                        else:
-                            print(f"DEBUG: Frame {frame_count} - Frame looks valid, using result")
-                            frame = processed_frame
-
-                        if non_zero_ratio < 0.1:  # Less than 10% non-zero pixels
-                            print(f"WARNING: Frame {frame_count} - Processed frame is mostly black ({non_zero_ratio:.4f}% non-zero)")
-                            # Use original frame if processed is mostly black
-                            frame = original_frame
-                        else:
-                            frame = processed_frame
-                    else:
-                        print(f"WARNING: Frame {frame_count} - process_frame_core returned None")
+                if fw <= max_width and fh <= max_height:
+                    output_width = fw
                 else:
-                    print(f"DEBUG: Frame {frame_count} - No faces detected, keeping original")
+                    scale = min(max_width / fw, max_height / fh)
+                    output_width = int(fw * scale)
 
-                out.write(frame)
-                frame_count += 1
+                output_width = max(320, output_width)
+                if output_width % 2 != 0:
+                    output_width += 1
+            elif media_type == 'video':
+                max_width = 3840
+                max_height = 2160
+                fw, fh = final_res
+                if fw > max_width or fh > max_height:
+                    # 计算缩放比例
+                    scale = min(max_width / fw, max_height / fh)
+                    new_w = int(fw * scale)
+                    new_h = int(fh * scale)
+                    # 确保偶数尺寸
+                    if new_w % 2 != 0: new_w -= 1
+                    if new_h % 2 != 0: new_h -= 1
+                    final_res = (new_w, new_h)
 
-                # Update progress
-                if total_frames > 0 and frame_count % 50 == 0:
-                    progress = min(80, 40 + int((frame_count / total_frames) * 40))
-                    TASK_STATUS[task_id] = {
-                        "status": "processing",
-                        "message": f"Processing frame {frame_count}/{total_frames}",
-                        "progress": progress
-                    }
+            print(f"[{task_id}] Target resolution: {final_res}, FPS: {final_fps}")
 
-            cap.release()
-            out.release()
+            # 使用优化的批处理方法
+            temp_out = await process_video_with_batches(
+                task_id, cap, output_path, loaded_pairs, params,
+                final_res, final_fps, media_type
+            )
+            temp_files.append(temp_out)
 
             TASK_STATUS[task_id] = {"status": "processing", "message": "Finalizing output", "progress": 90}
 
@@ -902,7 +1057,7 @@ def process_swap_task(task_id: str, params: dict):
                 # Convert to GIF using ffmpeg
                 subprocess.run([
                     'ffmpeg', '-y', '-i', temp_out,
-                    '-vf', 'fps=15,scale=480:-1:flags=lanczos',
+                    '-vf', f'fps={final_fps},scale={output_width}:-1:flags=lanczos',
                     output_path
                 ], check=True, capture_output=True)
             else:
@@ -911,21 +1066,34 @@ def process_swap_task(task_id: str, params: dict):
                     'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
                     '-i', temp_out
                 ]
+                probe_cmd = ['ffprobe', '-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=codec_type', '-of', 'default=noprint_wrappers=1:nokey=1', target_local]
+                try:
+                    result = subprocess.run(probe_cmd, check=True, capture_output=True, text=True)
+                    has_audio = result.stdout.strip() == 'audio'
+                except:
+                    has_audio = False
 
                 # Add audio if available in source
-                try:
-                    cmd.extend(['-i', target_local, '-c:v', 'copy', '-c:a', 'aac'])
+                if has_audio:
+                    cmd.extend(['-i', target_local, '-c:v', 'libx264', '-preset', 'medium', '-crf', '23', '-c:a', 'aac', '-b:a', '128k'])
                     cmd.extend(['-map', '0:v:0', '-map', '1:a:0', '-shortest'])
-                except:
-                    cmd.extend(['-c:v', 'copy'])
+                else:
+                    cmd.extend(['-c:v', 'libx264', '-preset', 'medium', '-crf', '23'])
 
                 cmd.append(output_path)
 
                 try:
                     subprocess.run(cmd, check=True, capture_output=True)
-                except subprocess.CalledProcessError:
+                except subprocess.CalledProcessError as e:
                     # Fallback: just move the processed video
-                    shutil.move(temp_out, output_path)
+                    print(f"WARNING: FFmpeg processing failed ({e}), using fallback")
+                    try:
+                        if os.path.exists(temp_out):
+                            shutil.move(temp_out, output_path)
+                        else:
+                            raise Exception(f"Temporary file {temp_out} does not exist")
+                    except Exception as fallback_error:
+                        raise Exception(f"Both FFmpeg and fallback failed: {fallback_error}")
 
         # Generate cover
         cover_path = generate_cover(output_path)
@@ -939,11 +1107,11 @@ def process_swap_task(task_id: str, params: dict):
             "cover": cover_path
         }
 
-        print(f"[{task_id}] Success: {output_path}")
+        print(f"[{task_id}] Success: {output_path} - Elapsed time: {(time.time() - start_time):.2f} seconds")
 
     except Exception as e:
         err_msg = str(e)
-        print(f"[{task_id}] FAILED: {err_msg}")
+        print(f"[{task_id}] FAILED: {err_msg} - Elapsed time: {(time.time() - start_time):.2f} seconds")
         traceback.print_exc()
 
         # Save error info
@@ -1161,7 +1329,7 @@ async def swap_multi(req: MultiSwapRequest, bg_tasks: BackgroundTasks):
         # Add to background tasks
         bg_tasks.add_task(process_swap_task_async, req.task_id, params)
 
-        return standard_response(data={"task_id": req.task_id, "status": "processing"})
+        return standard_response(code=404, message="Not found", data={"task_id": req.task_id})
 
     except Exception as e:
         return standard_response(code=500, message=f"Multi swap failed: {str(e)}")
@@ -1255,5 +1423,25 @@ if __name__ == "__main__":
     print(f">>> Output directory: {ARGS.output_dir}")
     print(f">>> Log file: {ARGS.log_file}")
 
-    # Run server
-    uvicorn.run(app, host=ARGS.host, port=ARGS.port, log_config=None)
+    # 优化服务器配置
+    print(f">>> Optimized server configuration:")
+    print(f">>> - Task workers: 16 (reduced from 32)")
+    print(f">>> - Batch workers: 4 (focused processing)")
+    print(f">>> - Batch size: {BATCH_SIZE} (optimized for throughput)")
+    print(f">>> - Server workers: 1 (single GPU)")
+    print(f">>> - GPU device ID: 0")
+
+    # Run server with optimized configuration
+    uvicorn.run(
+        app,
+        host=ARGS.host,
+        port=ARGS.port,
+        log_config=None,
+        workers=1,  # 单worker避免GPU内存竞争和模型重复加载
+        loop="uvloop",
+        http="httptools",
+        # 优化连接配置
+        limit_concurrency=50,   # 减少并发连接
+        timeout_keep_alive=30,  # 保持连接30秒
+        timeout_graceful_shutdown=30  # 优雅关闭30秒
+    )
