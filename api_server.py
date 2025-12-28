@@ -64,15 +64,6 @@ except ImportError as e2:
 def apply_patches():
     """Apply necessary monkey patches for NSFW bypass and numpy dimension issues"""
 
-    # 1. NSFW Bypass - Force disable content checking
-    def no_nsfw(frame):
-        return False
-
-    if hasattr(content_analyser, 'detect_nsfw'):
-        content_analyser.detect_nsfw = no_nsfw
-    else:
-        print("WARNING: content_analyser.detect_nsfw not found")
-
     # 2. Numpy Dimension Fix - Ensure 3-channel BGR format for detector
     original_detect_faces = detect_faces
 
